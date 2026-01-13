@@ -1,0 +1,18 @@
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #0b0f19; color: #e8eefc; }
+.app { max-width: 980px; margin: 0 auto; padding: 16px; }
+header { border-bottom: 1px solid #24314f; padding-bottom: 12px; margin-bottom: 12px; }
+h1 { margin: 0; font-size: 22px; }
+.sub { margin: 6px 0 0; color: #b7c6ef; font-size: 13px; }
+.status { margin-top: 10px; display: inline-block; padding: 6px 10px; border: 1px solid #24314f; border-radius: 10px; color: #b7c6ef; font-size: 12px; }
+.chat { height: 55vh; overflow: auto; padding: 12px; border: 1px solid #24314f; border-radius: 12px; background: #0f1630; }
+.bubble { max-width: 78%; padding: 10px 12px; margin: 8px 0; border-radius: 12px; white-space: pre-wrap; line-height: 1.35; }
+.bubble.user { margin-left: auto; background: #1e2a4d; border: 1px solid #2b3a67; }
+.bubble.assistant { margin-right: auto; background: #111c38; border: 1px solid #24314f; }
+.composer { display: flex; gap: 10px; margin-top: 12px; }
+textarea { flex: 1; resize: vertical; border-radius: 12px; padding: 10px; border: 1px solid #24314f; background: #0f1630; color: #e8eefc; }
+button { width: 110px; border-radius: 12px; border: 1px solid #24314f; background: #1e2a4d; color: #e8eefc; cursor: pointer; }
+.sources { margin-top: 16px; border-top: 1px solid #24314f; padding-top: 12px; }
+.source { border: 1px solid #24314f; border-radius: 12px; padding: 10px; margin: 10px 0; background: #0f1630; }
+.source-title { font-weight: 700; margin-bottom: 6px; }
+.source-preview { color: #d4ddf5; margin-bottom: 8px; white-space: pre-wrap; }
+.source-meta { margin: 0; font-size: 12px; color: #b7c6ef; overflow: auto; }
