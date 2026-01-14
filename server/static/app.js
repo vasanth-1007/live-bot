@@ -16,7 +16,9 @@ function addBubble(role, text) {
   return div;
 }
 
-function setStatus(t) { statusEl.textContent = t; }
+function setStatus(t) {
+  statusEl.textContent = t;
+}
 
 function renderSources(sources) {
   sourcesEl.innerHTML = "";
@@ -33,34 +35,25 @@ function renderSources(sources) {
       <pre class="source-meta"></pre>
     `;
     card.querySelector(".source-preview").textContent = s.text_preview || "";
-    card.querySelector(".source-meta").textContent = JSON.stringify(s.properties || {}, null, 2);
+    card.querySelector(".source-meta").textContent = JSON.stringify(
+      s.properties || {},
+      null,
+      2
+    );
     sourcesEl.appendChild(card);
   }
 }
 
 function connect() {
-  // FIX: Automatically use wss:// if on HTTPS, otherwise ws://
-  // This resolves the "Mixed Content" security error
+  // IMPORTANT: Use wss:// when the page is served over https://
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const wsUrl = `${protocol}//${window.location.host}/ws/chat`;
 
-  console.log("Attempting connection to:", wsUrl);
   ws = new WebSocket(wsUrl);
 
-  ws.onopen = () => {
-    console.log("WebSocket connection opened.");
-    setStatus("Connected");
-  };
-
-  ws.onclose = (evt) => {
-    console.warn("WebSocket closed:", evt);
-    setStatus("Disconnected");
-  };
-
-  ws.onerror = (evt) => {
-    console.error("WebSocket error:", evt);
-    setStatus("Connection Error");
-  };
+  ws.onopen = () => setStatus("Connected");
+  ws.onclose = () => setStatus("Disconnected");
+  ws.onerror = () => setStatus("Error");
 
   ws.onmessage = (evt) => {
     const msg = JSON.parse(evt.data);
