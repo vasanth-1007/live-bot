@@ -125,7 +125,8 @@ def retrieve_context(query: str) -> tuple[str, list[dict]]:
         return "", []
 
     try:
-        # Use 'gemini-embedding-001' to match ingestion script
+        # FIX 1: Use 'gemini-embedding-001' to match ingestion script
+        # Added task_type="RETRIEVAL_QUERY" for better accuracy
         embed_resp = gemini_client.models.embed_content(
             model="models/gemini-embedding-001",
             contents=query,
@@ -133,6 +134,7 @@ def retrieve_context(query: str) -> tuple[str, list[dict]]:
                 task_type="RETRIEVAL_QUERY"
             )
         )
+        # Flatten the embedding if needed (SDK returns a list of ContentEmbedding)
         query_vector = embed_resp.embeddings[0].values
 
         collection = weaviate_client.collections.get(settings.weaviate_collection)
@@ -140,7 +142,7 @@ def retrieve_context(query: str) -> tuple[str, list[dict]]:
         # Build query arguments
         query_kwargs = {
             "query": query,
-            "vector": query_vector,
+            "vector": query_vector,  # Explicitly pass the generated vector
             "limit": settings.top_k,
             "return_metadata": ["score", "explain_score"],
         }
@@ -258,10 +260,11 @@ async def handle_text_turn(ws: WebSocket, user_text: str):
 
     await ws.send_json({"type": "assistant_start"})
 
-    # Use "AUDIO" modality + output_audio_transcription
+    # FIX 2: Use ONLY "AUDIO" modality + output_audio_transcription
+    # Combining "AUDIO" and "TEXT" in response_modalities can cause 1007 errors
     config = {
         "response_modalities": ["AUDIO"],  
-        "output_audio_transcription": {},  
+        "output_audio_transcription": {},  # Required to get text back
         "speech_config": {
             "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
         },
@@ -292,7 +295,7 @@ async def handle_text_turn(ws: WebSocket, user_text: str):
                                 })
                                 await ws.send_bytes(part.inline_data.data)
 
-                    # Handle Text
+                    # Handle Text (Output Transcription)
                     if response.server_content.output_transcription:
                         ot = response.server_content.output_transcription
                         if ot.text:
@@ -330,6 +333,7 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
     # --- Step 1: Transcription ---
     transcribed_text = ""
     try:
+        # NOTE: response_modalities must be ["AUDIO"] to accept audio input
         transcribe_config = {
             "response_modalities": ["AUDIO"], 
             "input_audio_transcription": {}, 
@@ -340,12 +344,13 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
             model=settings.gemini_live_model,
             config=transcribe_config,
         ) as session:
-            # FIX: Use 'audio' kwarg instead of 'media_chunks' for send_realtime_input
             await session.send_realtime_input(
-                audio=types.Blob(
-                    mime_type=f"audio/pcm;rate={sample_rate}",
-                    data=audio_data,
-                )
+                media_chunks=[
+                    types.Blob(
+                        mime_type=f"audio/pcm;rate={sample_rate}",
+                        data=audio_data,
+                    )
+                ]
             )
 
             async for response in session.receive():
@@ -379,9 +384,11 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
     # --- Step 3: Response Generation ---
     full_text = ""
     try:
+        # FIX 3: Use "AUDIO" modality (without TEXT) + output_audio_transcription
+        # This prevents the 1007 Invalid Argument error
         response_config = {
             "response_modalities": ["AUDIO"],
-            "output_audio_transcription": {},
+            "output_audio_transcription": {},  # Required for getting text back
             "speech_config": {
                 "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
             },
@@ -392,7 +399,6 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
             model=settings.gemini_live_model,
             config=response_config,
         ) as session:
-            # Use send_client_content instead of deprecated send()
             await session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(text=transcribed_text)])],
                 turn_complete=True
@@ -410,7 +416,7 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
                                 })
                                 await ws.send_bytes(part.inline_data.data)
                     
-                    # Handle Text
+                    # Handle Text (from output transcription)
                     if response.server_content.output_transcription:
                         ot = response.server_content.output_transcription
                         if ot.text:

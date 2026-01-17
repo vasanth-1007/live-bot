@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import weaviate
+# ADDED: Import Auth for Weaviate v4 connection
 from weaviate.classes.init import Auth
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -75,6 +76,7 @@ async def lifespan(app: FastAPI):
             )
         else:
             # Custom / Local Connection
+            # UPDATED: Added auth_credentials here to fix 401 error
             weaviate_client = weaviate.connect_to_custom(
                 http_host=settings.http_host,
                 http_port=settings.http_port,
@@ -93,6 +95,8 @@ async def lifespan(app: FastAPI):
 
     # ── Gemini ──
     logger.info("Initializing Gemini client...")
+    # UPDATED: Ensure API key is picked up correctly if env var names conflict
+    # (Optional: explicitly pass api_key=settings.google_api_key if needed)
     gemini_client = genai.Client()
     logger.info(f"Gemini client ready, model: {settings.gemini_live_model}")
 
@@ -120,34 +124,25 @@ async def index():
 # RAG: Retrieve from Weaviate
 # ─────────────────────────────────────────────────────────────────────────────
 def retrieve_context(query: str) -> tuple[str, list[dict]]:
-    """Hybrid search in Weaviate using client-side embeddings."""
-    if not weaviate_client or not gemini_client:
+    """Hybrid search in Weaviate, return context string and source metadata."""
+    if not weaviate_client:
         return "", []
 
     try:
-        # Use 'gemini-embedding-001' to match ingestion script
-        embed_resp = gemini_client.models.embed_content(
-            model="models/gemini-embedding-001",
-            contents=query,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY"
-            )
-        )
-        query_vector = embed_resp.embeddings[0].values
-
         collection = weaviate_client.collections.get(settings.weaviate_collection)
         
         # Build query arguments
         query_kwargs = {
             "query": query,
-            "vector": query_vector,
             "limit": settings.top_k,
             "return_metadata": ["score", "explain_score"],
         }
         
+        # Add tenant if configured
         if settings.weaviate_tenant:
             collection = collection.with_tenant(settings.weaviate_tenant)
         
+        # Add target vector if configured
         if settings.weaviate_target_vector:
             query_kwargs["target_vector"] = settings.weaviate_target_vector
 
@@ -164,6 +159,7 @@ def retrieve_context(query: str) -> tuple[str, list[dict]]:
             chunks.append(text)
             total_chars += len(text)
 
+            # Build source info
             source_info = {
                 "id": str(obj.uuid),
                 "text_preview": text[:200] + "..." if len(text) > 200 else text,
@@ -193,6 +189,7 @@ async def websocket_chat(ws: WebSocket):
     await ws.accept()
     logger.info("WebSocket connected")
 
+    # Audio buffer for collecting voice input
     audio_buffer = bytearray()
     is_recording = False
     input_sample_rate = 16000
@@ -201,11 +198,13 @@ async def websocket_chat(ws: WebSocket):
         while True:
             message = await ws.receive()
 
+            # Handle binary audio data
             if "bytes" in message:
                 if is_recording:
                     audio_buffer.extend(message["bytes"])
                 continue
 
+            # Handle text/JSON messages
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
@@ -216,20 +215,27 @@ async def websocket_chat(ws: WebSocket):
                 msg_type = data.get("type")
 
                 if msg_type == "audio_start":
+                    # User started recording
                     is_recording = True
                     audio_buffer.clear()
                     input_sample_rate = data.get("sample_rate_hz", 16000)
                     logger.info(f"Audio recording started, sample_rate={input_sample_rate}")
 
                 elif msg_type == "audio_end":
+                    # User stopped recording - process the audio
                     is_recording = False
                     logger.info(f"Audio recording ended, {len(audio_buffer)} bytes")
                     
                     if len(audio_buffer) > 0:
-                        await handle_audio_turn(ws, bytes(audio_buffer), input_sample_rate)
+                        await handle_audio_turn(
+                            ws, 
+                            bytes(audio_buffer), 
+                            input_sample_rate
+                        )
                     audio_buffer.clear()
 
                 elif msg_type == "user_message":
+                    # Text message from user
                     text = data.get("text", "").strip()
                     if text:
                         await handle_text_turn(ws, text)
@@ -251,22 +257,30 @@ async def websocket_chat(ws: WebSocket):
 # Handle Text Input
 # ─────────────────────────────────────────────────────────────────────────────
 async def handle_text_turn(ws: WebSocket, user_text: str):
+    """Process text input, retrieve context, get response with audio."""
     logger.info(f"Text turn: {user_text[:100]}...")
 
+    # Retrieve context from Weaviate
     context, sources = retrieve_context(user_text)
     system_instruction = SYSTEM_PROMPT.format(context=context)
 
+    # Send start signal
     await ws.send_json({"type": "assistant_start"})
 
-    # Use "AUDIO" modality + output_audio_transcription
-    config = {
-        "response_modalities": ["AUDIO"],  
-        "output_audio_transcription": {},  
-        "speech_config": {
-            "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
-        },
-        "system_instruction": {"parts": [{"text": system_instruction}]},
-    }
+    # Configure for audio output
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO", "TEXT"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name="Kore"
+                )
+            )
+        ),
+        system_instruction=types.Content(
+            parts=[types.Part(text=system_instruction)]
+        ),
+    )
 
     full_text = ""
     
@@ -275,36 +289,49 @@ async def handle_text_turn(ws: WebSocket, user_text: str):
             model=settings.gemini_live_model,
             config=config,
         ) as session:
-            await session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text=user_text)])],
-                turn_complete=True
+            # Send user message
+            await session.send(
+                input=types.LiveClientContent(
+                    turns=[
+                        types.Content(
+                            role="user",
+                            parts=[types.Part(text=user_text)]
+                        )
+                    ],
+                    turn_complete=True,
+                ),
+                end_of_turn=True,
             )
 
+            # Receive response
             async for response in session.receive():
+                # Handle server content (text and audio)
                 if response.server_content:
-                    # Handle Audio
                     if response.server_content.model_turn:
                         for part in response.server_content.model_turn.parts:
+                            # Text part
+                            if part.text:
+                                full_text += part.text
+                                await ws.send_json({
+                                    "type": "assistant_delta",
+                                    "delta": part.text
+                                })
+                            
+                            # Audio part (inline_data)
                             if part.inline_data and part.inline_data.data:
+                                # Send audio format info first time
                                 await ws.send_json({
                                     "type": "assistant_audio_format",
                                     "mime_type": part.inline_data.mime_type or "audio/pcm;rate=24000"
                                 })
+                                # Send binary audio
                                 await ws.send_bytes(part.inline_data.data)
 
-                    # Handle Text
-                    if response.server_content.output_transcription:
-                        ot = response.server_content.output_transcription
-                        if ot.text:
-                            full_text += ot.text
-                            await ws.send_json({
-                                "type": "assistant_delta",
-                                "delta": ot.text
-                            })
-
+                    # Check if turn is complete
                     if response.server_content.turn_complete:
                         break
 
+        # Send completion
         await ws.send_json({
             "type": "assistant_done",
             "text": full_text or "(Voice response sent)",
@@ -324,15 +351,30 @@ async def handle_text_turn(ws: WebSocket, user_text: str):
 # Handle Audio Input
 # ─────────────────────────────────────────────────────────────────────────────
 async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
+    """Process audio input, transcribe, retrieve context, respond with audio."""
     logger.info(f"Audio turn: {len(audio_data)} bytes at {sample_rate}Hz")
+
+    # First, we need to transcribe the audio to text for RAG retrieval
+    # We'll use the Live API for this
+
+    # Send start signal
     await ws.send_json({"type": "assistant_start"})
 
-    # --- Step 1: Transcription ---
+    # For RAG, we need to first get the transcription
+    # We'll do a two-step process:
+    # 1. Send audio to get transcription
+    # 2. Use transcription for RAG lookup
+    # 3. Send context + audio to get final response
+
     transcribed_text = ""
+    
+    # Step 1: Transcribe audio
     try:
+        # Use a dict config to ensure input_audio_transcription is set correctly
+        # and response_modalities includes AUDIO (required for audio input).
         transcribe_config = {
-            "response_modalities": ["AUDIO"], 
-            "input_audio_transcription": {}, 
+            "response_modalities": ["AUDIO"],  # MUST be AUDIO for audio input
+            "input_audio_transcription": {},   # Enable transcription
             "system_instruction": "You are a transcriber. Do not speak. Wait for the next turn."
         }
 
@@ -340,25 +382,40 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
             model=settings.gemini_live_model,
             config=transcribe_config,
         ) as session:
-            # FIX: Use 'audio' kwarg instead of 'media_chunks' for send_realtime_input
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    mime_type=f"audio/pcm;rate={sample_rate}",
-                    data=audio_data,
-                )
+            # Send audio
+            await session.send(
+                input=types.LiveClientRealtimeInput(
+                    media_chunks=[
+                        types.Blob(
+                            mime_type=f"audio/pcm;rate={sample_rate}",
+                            data=audio_data,
+                        )
+                    ]
+                ),
+                end_of_turn=True,
             )
 
+            # Get transcription
             async for response in session.receive():
                 if response.server_content:
+                    # Capture the Transcription of the USER'S audio
+                    # The SDK exposes this as input_transcription
                     if hasattr(response.server_content, "input_transcription"):
                         it = response.server_content.input_transcription
                         if it and it.text:
                             transcribed_text += it.text
+                
+                # Check for turn completion
                 if response.server_content and response.server_content.turn_complete:
                     break
 
         logger.info(f"Transcribed: {transcribed_text[:100]}...")
-        await ws.send_json({"type": "user_transcript", "text": transcribed_text})
+        
+        # Send transcription to client
+        await ws.send_json({
+            "type": "user_transcript",
+            "text": transcribed_text
+        })
 
     except Exception as e:
         logger.error(f"Transcription error: {e}")
@@ -372,53 +429,64 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
         })
         return
 
-    # --- Step 2: RAG Retrieval ---
+    # Step 2: Retrieve context using transcribed text
     context, sources = retrieve_context(transcribed_text)
     system_instruction = SYSTEM_PROMPT.format(context=context)
 
-    # --- Step 3: Response Generation ---
+    # Step 3: Generate response with audio
     full_text = ""
+    
     try:
-        response_config = {
-            "response_modalities": ["AUDIO"],
-            "output_audio_transcription": {},
-            "speech_config": {
-                "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
-            },
-            "system_instruction": {"parts": [{"text": system_instruction}]},
-        }
+        response_config = types.LiveConnectConfig(
+            response_modalities=["AUDIO", "TEXT"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"
+                    )
+                )
+            ),
+            system_instruction=types.Content(
+                parts=[types.Part(text=system_instruction)]
+            ),
+        )
 
         async with gemini_client.aio.live.connect(
             model=settings.gemini_live_model,
             config=response_config,
         ) as session:
-            # Use send_client_content instead of deprecated send()
-            await session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(text=transcribed_text)])],
-                turn_complete=True
+            # Send the transcribed text as user input
+            await session.send(
+                input=types.LiveClientContent(
+                    turns=[
+                        types.Content(
+                            role="user",
+                            parts=[types.Part(text=transcribed_text)]
+                        )
+                    ],
+                    turn_complete=True,
+                ),
+                end_of_turn=True,
             )
 
+            # Receive response
             async for response in session.receive():
                 if response.server_content:
-                    # Handle Audio
                     if response.server_content.model_turn:
                         for part in response.server_content.model_turn.parts:
+                            if part.text:
+                                full_text += part.text
+                                await ws.send_json({
+                                    "type": "assistant_delta",
+                                    "delta": part.text
+                                })
+                            
                             if part.inline_data and part.inline_data.data:
                                 await ws.send_json({
                                     "type": "assistant_audio_format",
                                     "mime_type": part.inline_data.mime_type or "audio/pcm;rate=24000"
                                 })
                                 await ws.send_bytes(part.inline_data.data)
-                    
-                    # Handle Text
-                    if response.server_content.output_transcription:
-                        ot = response.server_content.output_transcription
-                        if ot.text:
-                            full_text += ot.text
-                            await ws.send_json({
-                                "type": "assistant_delta",
-                                "delta": ot.text
-                            })
 
                     if response.server_content.turn_complete:
                         break
@@ -438,6 +506,9 @@ async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
         })
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Run
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
