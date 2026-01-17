@@ -50,23 +50,23 @@ class WeaviateRetriever:
         if weaviate_url:
             if not weaviate_api_key:
                 raise RuntimeError("WEAVIATE_URL is set but WEAVIATE_API_KEY is empty.")
-            # Cloud connection helper (REST endpoint + API key)
+            # Cloud connection helper (REST endpoint + API key). ([docs.weaviate.io](https://docs.weaviate.io/weaviate/connections/connect-cloud?utm_source=openai))
             self.client = weaviate.connect_to_weaviate_cloud(
                 cluster_url=weaviate_url,
                 auth_credentials=Auth.api_key(weaviate_api_key),
                 additional_config=AdditionalConfig(timeout=Timeout(init=30, query=60, insert=120)),
             )
         else:
-            # Custom connection helper for local/self-hosted Weaviate
+            # Custom connection helper. ([docs.weaviate.io](https://docs.weaviate.io/weaviate/connections/connect-custom?utm_source=openai))
             auth = Auth.api_key(weaviate_api_key) if weaviate_api_key else None
             self.client = weaviate.connect_to_custom(
-                http_host=http_host or "localhost",
-                http_port=http_port or 8080,
-                http_secure=http_secure,
-                grpc_host=grpc_host or "localhost",
-                grpc_port=grpc_port or 50051,
-                grpc_secure=grpc_secure,
-                auth_credentials=auth,
+                http_host="localhost",
+                http_port=8080,
+                http_secure=false,
+                grpc_host=localhost,
+                grpc_port=50051,
+                grpc_secure=false,
+                auth_credentials=AuthApiKey(os.getenv("WEAVIATE_API_KEY")),
                 additional_config=AdditionalConfig(timeout=Timeout(init=30, query=60, insert=120)),
             )
 
@@ -74,7 +74,7 @@ class WeaviateRetriever:
             raise RuntimeError("Weaviate is not ready (check URL/host/ports/auth).")
 
         base = self.client.collections.get(self.collection_name)
-        # Multi-tenancy support if you need it (otherwise unused)
+        # Multi-tenancy support if you need it (otherwise unused). ([weaviate.io](https://weaviate.io/developers/weaviate/api/graphql/get?utm_source=openai))
         self.collection = base.with_tenant(self.tenant) if self.tenant else base
 
     def close(self):
@@ -87,7 +87,7 @@ class WeaviateRetriever:
         return_props = list(dict.fromkeys([self.text_property] + self.extra_properties))
         meta = MetadataQuery(score=True, distance=True)
 
-        # 1) Try HYBRID (vector + keyword)
+        # 1) Try HYBRID (vector + keyword). ([docs.weaviate.io](https://docs.weaviate.io/weaviate/search/hybrid?utm_source=openai))
         try:
             kwargs = dict(
                 query=query,
@@ -95,7 +95,7 @@ class WeaviateRetriever:
                 return_properties=return_props,
                 return_metadata=meta,
             )
-            # If your collection has named vectors, target_vector is required
+            # If your collection has named vectors, target_vector is required. ([docs.weaviate.io](https://docs.weaviate.io/weaviate/search/hybrid?utm_source=openai))
             if self.target_vector:
                 kwargs["target_vector"] = self.target_vector
 
@@ -103,7 +103,7 @@ class WeaviateRetriever:
             return _to_chunks(resp.objects, self.text_property)
 
         except Exception:
-            # 2) Fallback: BM25 keyword search (works even when vectors/hybrid aren't configured)
+            # 2) Fallback: BM25 keyword search (works even when vectors/hybrid aren’t configured)
             resp = self.collection.query.bm25(
                 query=query,
                 limit=top_k,

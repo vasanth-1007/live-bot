@@ -1,18 +1,438 @@
-body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background: #0b0f19; color: #e8eefc; }
-.app { max-width: 980px; margin: 0 auto; padding: 16px; }
-header { border-bottom: 1px solid #24314f; padding-bottom: 12px; margin-bottom: 12px; }
-h1 { margin: 0; font-size: 22px; }
-.sub { margin: 6px 0 0; color: #b7c6ef; font-size: 13px; }
-.status { margin-top: 10px; display: inline-block; padding: 6px 10px; border: 1px solid #24314f; border-radius: 10px; color: #b7c6ef; font-size: 12px; }
-.chat { height: 55vh; overflow: auto; padding: 12px; border: 1px solid #24314f; border-radius: 12px; background: #0f1630; }
-.bubble { max-width: 78%; padding: 10px 12px; margin: 8px 0; border-radius: 12px; white-space: pre-wrap; line-height: 1.35; }
-.bubble.user { margin-left: auto; background: #1e2a4d; border: 1px solid #2b3a67; }
-.bubble.assistant { margin-right: auto; background: #111c38; border: 1px solid #24314f; }
-.composer { display: flex; gap: 10px; margin-top: 12px; }
-textarea { flex: 1; resize: vertical; border-radius: 12px; padding: 10px; border: 1px solid #24314f; background: #0f1630; color: #e8eefc; }
-button { width: 110px; border-radius: 12px; border: 1px solid #24314f; background: #1e2a4d; color: #e8eefc; cursor: pointer; }
-.sources { margin-top: 16px; border-top: 1px solid #24314f; padding-top: 12px; }
-.source { border: 1px solid #24314f; border-radius: 12px; padding: 10px; margin: 10px 0; background: #0f1630; }
-.source-title { font-weight: 700; margin-bottom: 6px; }
-.source-preview { color: #d4ddf5; margin-bottom: 8px; white-space: pre-wrap; }
-.source-meta { margin: 0; font-size: 12px; color: #b7c6ef; overflow: auto; }
+/* ============================================================================
+   Gemini Live RAG - Styles
+   ============================================================================ */
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0b0f19 0%, #1a1f35 100%);
+    min-height: 100vh;
+    color: #e8eefc;
+}
+
+.app {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Header
+   ───────────────────────────────────────────────────────────────────────────── */
+
+header {
+    text-align: center;
+    padding: 20px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    margin-bottom: 20px;
+}
+
+header h1 {
+    font-size: 1.8rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.sub {
+    color: #8892b0;
+    font-size: 0.9rem;
+    margin-top: 8px;
+}
+
+.status {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    margin-top: 12px;
+    transition: all 0.3s ease;
+}
+
+.status.connecting {
+    background: rgba(255, 193, 7, 0.15);
+    color: #ffc107;
+    border: 1px solid rgba(255, 193, 7, 0.3);
+}
+
+.status.connected {
+    background: rgba(76, 175, 80, 0.15);
+    color: #4caf50;
+    border: 1px solid rgba(76, 175, 80, 0.3);
+}
+
+.status.disconnected {
+    background: rgba(244, 67, 54, 0.15);
+    color: #f44336;
+    border: 1px solid rgba(244, 67, 54, 0.3);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Chat Area
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.chat {
+    flex: 1;
+    min-height: 300px;
+    max-height: 50vh;
+    overflow-y: auto;
+    padding: 20px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    margin-bottom: 20px;
+}
+
+.welcome-message {
+    text-align: center;
+    color: #8892b0;
+    padding: 40px 20px;
+}
+
+.welcome-message p {
+    margin: 8px 0;
+}
+
+.bubble {
+    max-width: 80%;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 16px;
+    line-height: 1.5;
+    animation: fadeIn 0.3s ease;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.bubble.user {
+    margin-left: auto;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-bottom-right-radius: 4px;
+}
+
+.bubble.assistant {
+    margin-right: auto;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom-left-radius: 4px;
+}
+
+.bubble.assistant.playing {
+    border-left: 3px solid #4caf50;
+}
+
+.bubble.error {
+    background: rgba(244, 67, 54, 0.15);
+    border: 1px solid rgba(244, 67, 54, 0.3);
+    color: #ff6b6b;
+    text-align: center;
+    max-width: 100%;
+}
+
+/* Scrollbar */
+.chat::-webkit-scrollbar {
+    width: 6px;
+}
+
+.chat::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.chat::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 3px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Input Area
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.input-area {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    padding: 16px;
+    margin-bottom: 20px;
+}
+
+.text-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+textarea {
+    flex: 1;
+    padding: 12px 16px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #e8eefc;
+    font-size: 1rem;
+    font-family: inherit;
+    resize: none;
+    transition: all 0.2s ease;
+}
+
+textarea::placeholder {
+    color: #6b7280;
+}
+
+textarea:focus {
+    outline: none;
+    border-color: #667eea;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.send-btn {
+    width: 50px;
+    height: 50px;
+    border: none;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+}
+
+.send-btn:hover {
+    transform: scale(1.05);
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+}
+
+.send-btn:active {
+    transform: scale(0.98);
+}
+
+.send-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+/* Voice Controls */
+.voice-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+}
+
+.mic-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 28px;
+    border: none;
+    border-radius: 50px;
+    background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+    color: white;
+    font-size: 1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+.mic-btn:hover {
+    transform: scale(1.02);
+    box-shadow: 0 4px 20px rgba(240, 147, 251, 0.4);
+}
+
+.mic-btn.recording {
+    background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
+    animation: pulse-btn 1s infinite;
+}
+
+@keyframes pulse-btn {
+    0%, 100% {
+        box-shadow: 0 0 0 0 rgba(255, 65, 108, 0.7);
+    }
+    50% {
+        box-shadow: 0 0 0 15px rgba(255, 65, 108, 0);
+    }
+}
+
+.mic-btn .mic-icon {
+    transition: transform 0.2s ease;
+}
+
+.mic-btn.recording .mic-icon {
+    transform: scale(1.1);
+}
+
+.recording-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #ff416c;
+    font-weight: 500;
+    font-size: 0.9rem;
+}
+
+.pulse-dot {
+    width: 10px;
+    height: 10px;
+    background: #ff416c;
+    border-radius: 50%;
+    animation: pulse-dot 1s infinite;
+}
+
+@keyframes pulse-dot {
+    0%, 100% {
+        transform: scale(1);
+        opacity: 1;
+    }
+    50% {
+        transform: scale(1.3);
+        opacity: 0.7;
+    }
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* Transcript Preview */
+.transcript-preview {
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: rgba(102, 126, 234, 0.1);
+    border-left: 3px solid #667eea;
+    border-radius: 0 8px 8px 0;
+    font-size: 0.9rem;
+}
+
+.transcript-preview .label {
+    color: #667eea;
+    font-weight: 600;
+    margin-right: 8px;
+}
+
+#live-transcript {
+    color: #b8c5e8;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Sources Section
+   ───────────────────────────────────────────────────────────────────────────── */
+
+.sources-section {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    padding: 16px;
+}
+
+.sources-section h2 {
+    font-size: 1rem;
+    color: #8892b0;
+    margin-bottom: 12px;
+    font-weight: 600;
+}
+
+.sources {
+    color: #6b7280;
+    font-size: 0.9rem;
+}
+
+.source {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+.source:last-child {
+    margin-bottom: 0;
+}
+
+.source-title {
+    font-weight: 600;
+    color: #667eea;
+    font-size: 0.85rem;
+    margin-bottom: 6px;
+    word-break: break-all;
+}
+
+.source-preview {
+    color: #b8c5e8;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    margin-bottom: 8px;
+    white-space: pre-wrap;
+}
+
+.source-meta {
+    font-size: 0.75rem;
+    color: #6b7280;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 8px;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Responsive
+   ───────────────────────────────────────────────────────────────────────────── */
+
+@media (max-width: 600px) {
+    .app {
+        padding: 12px;
+    }
+
+    header h1 {
+        font-size: 1.4rem;
+    }
+
+    .chat {
+        max-height: 40vh;
+    }
+
+    .bubble {
+        max-width: 90%;
+    }
+
+    .mic-btn {
+        padding: 12px 20px;
+        font-size: 0.9rem;
+    }
+
+    .text-row {
+        flex-direction: column;
+    }
+
+    .send-btn {
+        width: 100%;
+        height: 44px;
+    }
+}

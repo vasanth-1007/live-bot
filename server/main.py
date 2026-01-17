@@ -1,260 +1,514 @@
-from __future__ import annotations
+"""
+Gemini Live + Weaviate RAG Server
+Supports both text and voice (audio) input/output
+"""
 
 import asyncio
 import json
+import logging
+import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from dotenv import load_dotenv
+import weaviate
+# ADDED: Import Auth for Weaviate v4 connection
+from weaviate.classes.init import Auth
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from google import genai
+from google.genai import types
 
-from .config import Settings
-from .rag.retriever import WeaviateRetriever
-from .rag.prompts import SYSTEM_INSTRUCTION, build_user_prompt
-from .live.gemini_live import (
-    GeminiLiveAudioSession,
-    GeminiLiveTranscribeSession,
-    extract_audio_bytes,
-    extract_input_transcript,
-    extract_output_transcript,
-    is_turn_complete,
-    delta_from_full,
+from server.config import Settings
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
+logger = logging.getLogger("gemini-live-rag")
 
-load_dotenv()
+# ─────────────────────────────────────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────────────────────────────────────
 settings = Settings()
+weaviate_client: weaviate.WeaviateClient | None = None
+gemini_client: genai.Client | None = None
 
-BASE_DIR = Path(__file__).resolve().parent
-WEB_DIR = BASE_DIR / "web"
+WEB_DIR = Path(__file__).parent / "web"
 
-app = FastAPI(title="Gemini Live (Voice) + Weaviate RAG (Tanglish)")
-app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+# ─────────────────────────────────────────────────────────────────────────────
+# System Prompt
+# ─────────────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a helpful voice assistant that answers questions using ONLY the provided context from our knowledge base.
 
-retriever: WeaviateRetriever | None = None
+IMPORTANT RULES:
+1. Answer ONLY based on the context provided below
+2. If the context doesn't contain the answer, say "I don't have information about that in my knowledge base"
+3. Keep responses concise and conversational since this is voice output
+4. Speak naturally as if having a conversation
+
+CONTEXT FROM KNOWLEDGE BASE:
+{context}
+
+Now answer the user's question based solely on the above context."""
 
 
-@app.on_event("startup")
-def _startup():
-    global retriever
-    retriever = WeaviateRetriever(
-        collection_name=settings.weaviate_collection,
-        text_property=settings.weaviate_text_property,
-        extra_properties=settings.extra_properties,
-        tenant=settings.weaviate_tenant,
-        target_vector=settings.weaviate_target_vector,
-        weaviate_url=settings.weaviate_url,
-        weaviate_api_key=settings.weaviate_api_key,
-        http_host=settings.http_host,
-        http_port=settings.http_port,
-        http_secure=settings.http_secure,
-        grpc_host=settings.grpc_host,
-        grpc_port=settings.grpc_port,
-        grpc_secure=settings.grpc_secure,
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifespan (startup/shutdown)
+# ─────────────────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global weaviate_client, gemini_client
+
+    # ── Weaviate ──
+    logger.info("Connecting to Weaviate...")
+    try:
+        if settings.weaviate_url:
+            # Cloud Connection
+            weaviate_client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=settings.weaviate_url,
+                auth_credentials=Auth.api_key(settings.weaviate_api_key)
+                if settings.weaviate_api_key else None,
+            )
+        else:
+            # Custom / Local Connection
+            # UPDATED: Added auth_credentials here to fix 401 error
+            weaviate_client = weaviate.connect_to_custom(
+                http_host=settings.http_host,
+                http_port=settings.http_port,
+                http_secure=settings.http_secure,
+                grpc_host=settings.grpc_host,
+                grpc_port=settings.grpc_port,
+                grpc_secure=settings.grpc_secure,
+                auth_credentials=Auth.api_key(settings.weaviate_api_key) 
+                if settings.weaviate_api_key else None,
+            )
+        logger.info("Weaviate connected ✓")
+    except Exception as e:
+        logger.error(f"Weaviate connection failed: {e}")
+        # Consider whether to raise here or allow app to start without RAG
+        raise
+
+    # ── Gemini ──
+    logger.info("Initializing Gemini client...")
+    # UPDATED: Ensure API key is picked up correctly if env var names conflict
+    # (Optional: explicitly pass api_key=settings.google_api_key if needed)
+    gemini_client = genai.Client()
+    logger.info(f"Gemini client ready, model: {settings.gemini_live_model}")
+
+    yield
+
+    # ── Cleanup ──
+    if weaviate_client:
+        weaviate_client.close()
+        logger.info("Weaviate closed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FastAPI App
+# ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Gemini Live RAG", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(WEB_DIR / "index.html")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAG: Retrieve from Weaviate
+# ─────────────────────────────────────────────────────────────────────────────
+def retrieve_context(query: str) -> tuple[str, list[dict]]:
+    """Hybrid search in Weaviate, return context string and source metadata."""
+    if not weaviate_client:
+        return "", []
+
+    try:
+        collection = weaviate_client.collections.get(settings.weaviate_collection)
+        
+        # Build query arguments
+        query_kwargs = {
+            "query": query,
+            "limit": settings.top_k,
+            "return_metadata": ["score", "explain_score"],
+        }
+        
+        # Add tenant if configured
+        if settings.weaviate_tenant:
+            collection = collection.with_tenant(settings.weaviate_tenant)
+        
+        # Add target vector if configured
+        if settings.weaviate_target_vector:
+            query_kwargs["target_vector"] = settings.weaviate_target_vector
+
+        results = collection.query.hybrid(**query_kwargs)
+
+        chunks = []
+        sources = []
+        total_chars = 0
+
+        for obj in results.objects:
+            text = obj.properties.get(settings.weaviate_text_property, "")
+            if total_chars + len(text) > settings.max_context_chars:
+                break
+            chunks.append(text)
+            total_chars += len(text)
+
+            # Build source info
+            source_info = {
+                "id": str(obj.uuid),
+                "text_preview": text[:200] + "..." if len(text) > 200 else text,
+                "properties": {
+                    k: v for k, v in obj.properties.items()
+                    if k in settings.extra_properties
+                },
+            }
+            if obj.metadata and obj.metadata.score is not None:
+                source_info["score"] = round(obj.metadata.score, 4)
+            sources.append(source_info)
+
+        context = "\n\n---\n\n".join(chunks) if chunks else "(No relevant documents found)"
+        logger.info(f"Retrieved {len(chunks)} chunks for query: {query[:50]}...")
+        return context, sources
+
+    except Exception as e:
+        logger.error(f"Weaviate retrieval error: {e}")
+        return "(Error retrieving context)", []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket Chat Handler
+# ─────────────────────────────────────────────────────────────────────────────
+@app.websocket("/ws/chat")
+async def websocket_chat(ws: WebSocket):
+    await ws.accept()
+    logger.info("WebSocket connected")
+
+    # Audio buffer for collecting voice input
+    audio_buffer = bytearray()
+    is_recording = False
+    input_sample_rate = 16000
+
+    try:
+        while True:
+            message = await ws.receive()
+
+            # Handle binary audio data
+            if "bytes" in message:
+                if is_recording:
+                    audio_buffer.extend(message["bytes"])
+                continue
+
+            # Handle text/JSON messages
+            if "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    await ws.send_json({"type": "error", "message": "Invalid JSON"})
+                    continue
+
+                msg_type = data.get("type")
+
+                if msg_type == "audio_start":
+                    # User started recording
+                    is_recording = True
+                    audio_buffer.clear()
+                    input_sample_rate = data.get("sample_rate_hz", 16000)
+                    logger.info(f"Audio recording started, sample_rate={input_sample_rate}")
+
+                elif msg_type == "audio_end":
+                    # User stopped recording - process the audio
+                    is_recording = False
+                    logger.info(f"Audio recording ended, {len(audio_buffer)} bytes")
+                    
+                    if len(audio_buffer) > 0:
+                        await handle_audio_turn(
+                            ws, 
+                            bytes(audio_buffer), 
+                            input_sample_rate
+                        )
+                    audio_buffer.clear()
+
+                elif msg_type == "user_message":
+                    # Text message from user
+                    text = data.get("text", "").strip()
+                    if text:
+                        await handle_text_turn(ws, text)
+
+                elif msg_type == "ping":
+                    await ws.send_json({"type": "pong"})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}\n{traceback.format_exc()}")
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Handle Text Input
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_text_turn(ws: WebSocket, user_text: str):
+    """Process text input, retrieve context, get response with audio."""
+    logger.info(f"Text turn: {user_text[:100]}...")
+
+    # Retrieve context from Weaviate
+    context, sources = retrieve_context(user_text)
+    system_instruction = SYSTEM_PROMPT.format(context=context)
+
+    # Send start signal
+    await ws.send_json({"type": "assistant_start"})
+
+    # Configure for audio output
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO", "TEXT"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                    voice_name="Kore"
+                )
+            )
+        ),
+        system_instruction=types.Content(
+            parts=[types.Part(text=system_instruction)]
+        ),
     )
 
+    full_text = ""
+    
+    try:
+        async with gemini_client.aio.live.connect(
+            model=settings.gemini_live_model,
+            config=config,
+        ) as session:
+            # Send user message
+            await session.send(
+                input=types.LiveClientContent(
+                    turns=[
+                        types.Content(
+                            role="user",
+                            parts=[types.Part(text=user_text)]
+                        )
+                    ],
+                    turn_complete=True,
+                ),
+                end_of_turn=True,
+            )
 
-@app.on_event("shutdown")
-def _shutdown():
-    global retriever
-    if retriever:
-        retriever.close()
-        retriever = None
+            # Receive response
+            async for response in session.receive():
+                # Handle server content (text and audio)
+                if response.server_content:
+                    if response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            # Text part
+                            if part.text:
+                                full_text += part.text
+                                await ws.send_json({
+                                    "type": "assistant_delta",
+                                    "delta": part.text
+                                })
+                            
+                            # Audio part (inline_data)
+                            if part.inline_data and part.inline_data.data:
+                                # Send audio format info first time
+                                await ws.send_json({
+                                    "type": "assistant_audio_format",
+                                    "mime_type": part.inline_data.mime_type or "audio/pcm;rate=24000"
+                                })
+                                # Send binary audio
+                                await ws.send_bytes(part.inline_data.data)
 
+                    # Check if turn is complete
+                    if response.server_content.turn_complete:
+                        break
 
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return (WEB_DIR / "index.html").read_text(encoding="utf-8")
-
-
-@app.websocket("/ws/chat")
-async def ws_chat(ws: WebSocket):
-    await ws.accept()
-
-    if retriever is None:
-        await ws.send_text(json.dumps({"type": "error", "message": "Retriever not initialized"}))
-        await ws.close()
-        return
-
-    # One long-lived AUDIO session for answering (TTS output).
-    async with GeminiLiveAudioSession(
-        model=settings.gemini_live_model,
-        system_instruction=SYSTEM_INSTRUCTION,
-        voice_name=getattr(settings, "gemini_voice_name", "Kore"),
-    ) as answer_session:
-        try:
-            # Tell the client what audio format to expect from the assistant.
-            await ws.send_text(json.dumps({
-                "type": "assistant_audio_format",
-                "mime_type": "audio/pcm;rate=24000",
-                "note": "Raw PCM16 mono @ 24kHz, little-endian"
-            }))
-
-            while True:
-                incoming = await ws.receive()
-
-                # --- 1) Binary frames: we only accept them inside an audio turn.
-                if incoming.get("bytes") is not None:
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Unexpected binary frame. Send {type: audio_start} first."
-                    }))
-                    continue
-
-                # --- 2) Text frames are JSON control/messages.
-                raw_text = incoming.get("text")
-                if not raw_text:
-                    continue
-
-                msg = json.loads(raw_text)
-                mtype = msg.get("type")
-
-                # A) Text chat (existing behavior) BUT now assistant responds in AUDIO (+ transcript deltas)
-                if mtype == "user_message":
-                    user_text = (msg.get("text") or "").strip()
-                    if not user_text:
-                        continue
-                    await _handle_text_turn(ws, answer_session, user_text)
-
-                # B) Audio chat: client sends audio_start, then binary PCM chunks, then audio_end
-                elif mtype == "audio_start":
-                    sample_rate = int(msg.get("sample_rate_hz") or 16000)
-                    await _handle_audio_turn(ws, answer_session, sample_rate_hz=sample_rate)
-
-                else:
-                    await ws.send_text(json.dumps({"type": "error", "message": "Unknown message type"}))
-
-        except WebSocketDisconnect:
-            return
-
-
-async def _handle_text_turn(ws: WebSocket, answer_session: GeminiLiveAudioSession, user_text: str) -> None:
-    assert retriever is not None
-
-    # 1) Retrieve from Weaviate
-    chunks = retriever.retrieve(user_text, top_k=settings.top_k)
-
-    if not chunks:
-        await ws.send_text(json.dumps({
+        # Send completion
+        await ws.send_json({
             "type": "assistant_done",
-            "text": "Indha kelvikku thevaiyana thagaval enakku Weaviate-la kidaikkala.",
-            "sources": [],
-        }))
-        return
-
-    prompt = build_user_prompt(user_text, chunks, settings.max_context_chars)
-
-    sources_payload = []
-    for i, ch in enumerate(chunks, start=1):
-        sources_payload.append({
-            "id": f"S{i}",
-            "text_preview": ch.text[:300],
-            "properties": ch.properties,
-            "score": ch.score,
-            "distance": ch.distance,
+            "text": full_text or "(Voice response sent)",
+            "sources": sources,
         })
 
-    await ws.send_text(json.dumps({"type": "assistant_start"}))
-
-    # 2) Ask Gemini (AUDIO response)
-    await answer_session.send_text_turn(prompt)
-
-    # 3) Stream back:
-    #    - audio bytes as binary frames
-    #    - output transcription deltas as JSON (so your UI can show text)
-    full_out = ""
-    async for live_msg in answer_session.receive():
-        audio = extract_audio_bytes(live_msg)
-        if audio:
-            await ws.send_bytes(audio)
-
-        out_t = extract_output_transcript(live_msg)
-        if out_t:
-            delta = delta_from_full(full_out, out_t)
-            if delta:
-                full_out = out_t
-                await ws.send_text(json.dumps({"type": "assistant_delta", "delta": delta}))
-
-        if is_turn_complete(live_msg):
-            break
-
-    await ws.send_text(json.dumps({
-        "type": "assistant_done",
-        "text": full_out.strip(),
-        "sources": sources_payload,
-    }))
+    except Exception as e:
+        logger.error(f"Gemini error: {e}\n{traceback.format_exc()}")
+        await ws.send_json({
+            "type": "assistant_done",
+            "text": f"Error: {str(e)}",
+            "sources": sources,
+        })
 
 
-async def _handle_audio_turn(ws: WebSocket, answer_session: GeminiLiveAudioSession, *, sample_rate_hz: int) -> None:
-    """
-    Protocol:
-      1) client -> {"type":"audio_start","sample_rate_hz":16000}
-      2) client -> (binary PCM16 chunks)
-      3) client -> {"type":"audio_end"}
+# ─────────────────────────────────────────────────────────────────────────────
+# Handle Audio Input
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_audio_turn(ws: WebSocket, audio_data: bytes, sample_rate: int):
+    """Process audio input, transcribe, retrieve context, respond with audio."""
+    logger.info(f"Audio turn: {len(audio_data)} bytes at {sample_rate}Hz")
 
-    We:
-      - run a transcription Live session while receiving chunks
-      - stream partial transcripts to client
-      - once ended, run the normal RAG flow using the final transcript text
-    """
-    assert retriever is not None
+    # First, we need to transcribe the audio to text for RAG retrieval
+    # We'll use the Live API for this
 
-    await ws.send_text(json.dumps({
-        "type": "audio_ack",
-        "sample_rate_hz": sample_rate_hz,
-        "expected_mime_type": f"audio/pcm;rate={sample_rate_hz}",
-        "note": "Send raw PCM16 mono little-endian chunks as binary frames, then {type: audio_end}."
-    }))
+    # Send start signal
+    await ws.send_json({"type": "assistant_start"})
 
-    transcript_full = ""
+    # For RAG, we need to first get the transcription
+    # We'll do a two-step process:
+    # 1. Send audio to get transcription
+    # 2. Use transcription for RAG lookup
+    # 3. Send context + audio to get final response
 
-    async with GeminiLiveTranscribeSession(model=settings.gemini_live_model) as stt:
-        mic_done = asyncio.Event()
+    transcribed_text = ""
+    
+    # Step 1: Transcribe audio
+    try:
+        transcribe_config = types.LiveConnectConfig(
+            response_modalities=["TEXT"],
+            system_instruction=types.Content(
+                parts=[types.Part(text="Transcribe the user's speech accurately. Only output the transcription, nothing else.")]
+            ),
+        )
 
-        async def ws_to_stt():
-            nonlocal transcript_full
-            try:
-                while True:
-                    incoming = await ws.receive()
-                    if incoming.get("bytes") is not None:
-                        await stt.send_audio_chunk(incoming["bytes"], sample_rate_hz=sample_rate_hz)
-                        continue
+        async with gemini_client.aio.live.connect(
+            model=settings.gemini_live_model,
+            config=transcribe_config,
+        ) as session:
+            # Send audio
+            await session.send(
+                input=types.LiveClientRealtimeInput(
+                    media_chunks=[
+                        types.Blob(
+                            mime_type=f"audio/pcm;rate={sample_rate}",
+                            data=audio_data,
+                        )
+                    ]
+                ),
+                end_of_turn=True,
+            )
 
-                    raw_text = incoming.get("text")
-                    if not raw_text:
-                        continue
-                    ctrl = json.loads(raw_text)
-                    if ctrl.get("type") == "audio_end":
-                        mic_done.set()
-                        await stt.audio_stream_end()
-                        return
-                    # Ignore other messages during recording.
-            except WebSocketDisconnect:
-                mic_done.set()
-                raise
+            # Get transcription
+            async for response in session.receive():
+                if response.server_content and response.server_content.model_turn:
+                    for part in response.server_content.model_turn.parts:
+                        if part.text:
+                            transcribed_text += part.text
+                
+                if response.server_content and response.server_content.turn_complete:
+                    break
 
-        async def stt_to_ws():
-            nonlocal transcript_full
-            last_sent = ""
-            async for live_msg in stt.receive():
-                t = extract_input_transcript(live_msg)
-                if t:
-                    transcript_full = t
-                    delta = delta_from_full(last_sent, t)
-                    if delta:
-                        last_sent = t
-                        await ws.send_text(json.dumps({"type": "user_transcript_delta", "delta": delta}))
+        logger.info(f"Transcribed: {transcribed_text[:100]}...")
+        
+        # Send transcription to client
+        await ws.send_json({
+            "type": "user_transcript",
+            "text": transcribed_text
+        })
 
-                # Once mic is done, we can exit when the turn is complete.
-                if mic_done.is_set() and is_turn_complete(live_msg):
-                    return
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        transcribed_text = ""
 
-        await asyncio.gather(ws_to_stt(), stt_to_ws())
-
-    final_text = (transcript_full or "").strip()
-    if not final_text:
-        await ws.send_text(json.dumps({"type": "error", "message": "No transcription produced."}))
+    if not transcribed_text.strip():
+        await ws.send_json({
+            "type": "assistant_done",
+            "text": "I couldn't understand the audio. Please try again.",
+            "sources": [],
+        })
         return
 
-    # Now run the normal RAG+answer pipeline using the transcript as user_text
-    await _handle_text_turn(ws, answer_session, final_text)
+    # Step 2: Retrieve context using transcribed text
+    context, sources = retrieve_context(transcribed_text)
+    system_instruction = SYSTEM_PROMPT.format(context=context)
+
+    # Step 3: Generate response with audio
+    full_text = ""
+    
+    try:
+        response_config = types.LiveConnectConfig(
+            response_modalities=["AUDIO", "TEXT"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name="Kore"
+                    )
+                )
+            ),
+            system_instruction=types.Content(
+                parts=[types.Part(text=system_instruction)]
+            ),
+        )
+
+        async with gemini_client.aio.live.connect(
+            model=settings.gemini_live_model,
+            config=response_config,
+        ) as session:
+            # Send the transcribed text as user input
+            await session.send(
+                input=types.LiveClientContent(
+                    turns=[
+                        types.Content(
+                            role="user",
+                            parts=[types.Part(text=transcribed_text)]
+                        )
+                    ],
+                    turn_complete=True,
+                ),
+                end_of_turn=True,
+            )
+
+            # Receive response
+            async for response in session.receive():
+                if response.server_content:
+                    if response.server_content.model_turn:
+                        for part in response.server_content.model_turn.parts:
+                            if part.text:
+                                full_text += part.text
+                                await ws.send_json({
+                                    "type": "assistant_delta",
+                                    "delta": part.text
+                                })
+                            
+                            if part.inline_data and part.inline_data.data:
+                                await ws.send_json({
+                                    "type": "assistant_audio_format",
+                                    "mime_type": part.inline_data.mime_type or "audio/pcm;rate=24000"
+                                })
+                                await ws.send_bytes(part.inline_data.data)
+
+                    if response.server_content.turn_complete:
+                        break
+
+        await ws.send_json({
+            "type": "assistant_done",
+            "text": full_text or "(Voice response sent)",
+            "sources": sources,
+        })
+
+    except Exception as e:
+        logger.error(f"Response generation error: {e}\n{traceback.format_exc()}")
+        await ws.send_json({
+            "type": "assistant_done",
+            "text": f"Error generating response: {str(e)}",
+            "sources": sources,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Run
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "server.main:app",
+        host=settings.app_host,
+        port=settings.app_port,
+        reload=True,
+    )

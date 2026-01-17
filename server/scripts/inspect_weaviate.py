@@ -1,16 +1,17 @@
 import os
 import weaviate
 from weaviate.classes.init import Auth
-
+from weaviate.auth import AuthApiKey
 def main():
+    # Correct for local Weaviate
     client = weaviate.connect_to_custom(
-        http_host=os.environ["WEAVIATE_HTTP_HOST"],
-        http_port=int(os.getenv("WEAVIATE_HTTP_PORT", "443")),
-        http_secure=os.getenv("WEAVIATE_HTTP_SECURE", "true").lower() == "true",
-        grpc_host=os.environ["WEAVIATE_GRPC_HOST"],
-        grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "443")),
-        grpc_secure=os.getenv("WEAVIATE_GRPC_SECURE", "true").lower() == "true",
-        auth_credentials=Auth.api_key(os.environ["WEAVIATE_API_KEY"]),  # <-- important
+        http_host="localhost",
+        http_port=8080,
+        http_secure=False,  # ← HTTP, not HTTPS
+        grpc_host="localhost",
+        grpc_port=50051,
+        grpc_secure=False,  # ← No TLS
+	auth_credentials=AuthApiKey("F3z3z27ZUls3pIQ5tW"),
     )
 
     print(client.is_ready())
